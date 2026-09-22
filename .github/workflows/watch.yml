@@ -1,0 +1,55 @@
+name: Сторож торгов
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'       # каждые 15 минут
+  workflow_dispatch:              # кнопка «запустить вручную»
+    inputs:
+      mode:
+        description: 'Что сделать'
+        required: false
+        default: normal
+        type: choice
+        options:
+          - normal      # обычная проверка: прислать только новые лоты
+          - test        # проверка связи: прислать тестовое сообщение
+          - init        # сброс памяти: запомнить текущие лоты и ничего не слать
+
+permissions:
+  contents: write                 # нужно, чтобы бот сохранял память о лотах
+
+concurrency:
+  group: torgi-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Проверить площадки
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TORGI_HOME: ${{ github.workspace }}/state
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          case "$MODE" in
+            test) ruby tgbot.rb --test ;;
+            init) ruby tgbot.rb --init ;;
+            *)    ruby tgbot.rb ;;
+          esac
+
+      - name: Запомнить отправленное
+        if: always()
+        run: |
+          git config user.name  "torgi-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f state/seen.json
+          git diff --staged --quiet || git commit -m "память бота"
+          git push || true
