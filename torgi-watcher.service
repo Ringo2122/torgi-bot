@@ -1,0 +1,25 @@
+[Unit]
+Description=Сторож торгов — новые лоты в Telegram
+Documentation=https://e-auction.by https://ipmtorgi.by
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=torgi
+Group=torgi
+Environment=TORGI_HOME=/var/lib/torgi
+Environment=LANG=ru_RU.UTF-8
+WorkingDirectory=/opt/torgi-bot
+ExecStart=/usr/bin/ruby /opt/torgi-bot/tgbot.rb
+TimeoutStartSec=300
+
+# ограничения: боту не нужно ничего, кроме сети и своего каталога
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/torgi
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
