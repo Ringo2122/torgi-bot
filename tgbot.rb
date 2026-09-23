@@ -1,7 +1,8 @@
 #!/usr/bin/env ruby
 # encoding: utf-8
 #
-# Сторож торгов: следит за разделами недвижимости и транспорта на e-auction.by и ipmtorgi.by
+# Сторож торгов: следит за разделами недвижимости и транспорта на e-auction.by, ipmtorgi.by
+# и beltorgi.by
 # и шлёт в Telegram карточку по каждому новому лоту: фото, цена, дата окончания приёма заявок.
 #
 #   ruby tgbot.rb --init    первый запуск: запомнить текущие лоты и НИЧЕГО не слать
@@ -35,7 +36,11 @@ SECTIONS = [
   ['e-auction.by', 'Легковые авто',          'https://e-auction.by/legkovye_avtomobili/'],
   ['e-auction.by', 'Грузовые и автобусы',    'https://e-auction.by/gruzovaya_tekhnika_i_avtobusy/'],
   ['ipmtorgi.by',  'Недвижимость',           'https://ipmtorgi.by/auctions/nedvizhimost/'],
-  ['ipmtorgi.by',  'Транспорт и спецтехника','https://ipmtorgi.by/auctions/transport-i-spetstekhnika/']
+  ['ipmtorgi.by',  'Транспорт и спецтехника','https://ipmtorgi.by/auctions/transport-i-spetstekhnika/'],
+  ['beltorgi.by',  'Недвижимость',           'https://beltorgi.by/nedvizhimost/'],
+  ['beltorgi.by',  'Легковые авто',          'https://beltorgi.by/legkovye-avto/'],
+  ['beltorgi.by',  'Грузовые и автобусы',    'https://beltorgi.by/gruzovye-avto/'],
+  ['beltorgi.by',  'Грузовые и автобусы',    'https://beltorgi.by/avtobusy/']
 ].freeze
 
 def log(msg)
@@ -132,6 +137,84 @@ def parse_ipm(html, section)
   end.compact
 end
 
+# ---------- beltorgi.by ----------
+# Каталог грузится скриптом. Страница раздела отдаёт content_id и cachekey (он меняется
+# при каждом открытии), а карточки приходят JSON-ом из POST /assets/category.php, по 80.
+# На карточке нет ни даты публикации, ни срока заявок — только обратный отсчёт.
+# Поэтому срок из отсчёта — прикидка, а точные даты новых лотов берутся из самого лота.
+BT = 'https://beltorgi.by'
+
+def post_json(url, data)
+  out = IO.popen(['curl', '-sS', '-m', '60', '-A', UA, '-H', 'X-Requested-With: XMLHttpRequest',
+                  '-d', data, url], err: File::NULL, &:read)
+  JSON.parse(out.to_s.force_encoding('UTF-8'))
+rescue JSON::ParserError
+  nil
+end
+
+def parse_bt(html, section)
+  html.split('class="col mb-4"').drop(1).map do |ch|
+    id   = ch[/card-img-top-(\d+)/, 1]
+    href = ch[/<a class="text-dark" href="([^"]+)"/, 1]
+    next nil unless id && href
+    thumb = ch[%r{src="(/assets/images/products/\d+/small/[^"]+)"}, 1]
+    title, left = ch.match(/class="clock" title="([^"]*)">(.*?)<\/div>/m).to_a.drop(1)
+    left = clean(left)
+    secs = { 'дн' => 86_400, 'час' => 3600, 'мин' => 60 }
+           .sum { |u, k| left[/(\d+)\s*#{u}/, 1].to_i * k }
+    # «До начала приёма заявок» — лот объявлен, но срок заявок ещё не виден
+    est = title.to_s.include?('окончания') && secs.positive? ? Time.now + secs : nil
+    { id: "beltorgi.by|#{id}", platform: 'beltorgi.by', section: section,
+      name: clean(ch[/class="card-title[^"]*">(.*?)<\/a>/m, 1]),
+      price: ch[/<span class="price"><span>([^<]+)/, 1].to_s.gsub(/[^\d,]/, '').tr(',', '.').to_f,
+      deadline: est, photo: thumb ? BT + thumb.sub('/small/', '/big/') : nil,
+      url: "#{BT}/#{href}" }
+  end.compact
+end
+
+def collect_bt(section, base)
+  page = fetch(base)
+  cid = page && page[/name="content_id" value="(\d+)"/, 1]
+  key = page && page[/name="cachekey" value="(\d+)"/, 1]
+  unless cid && key
+    log("не ответил: #{base}")
+    return [[], false]
+  end
+  form = "content_id=#{cid}&cachekey=#{key}&tpl=CardTplList&view=tab&tpltable=CardTplTable" \
+         '&ListWrapper=ListWrapper&filtr%5Barray%5D%5Bresult%5D=1%2C6%2C8&limit=80&sort=1&order=1'
+  out = []
+  ids = {}
+  pages = 0
+  (1..MAX_PAGES).each do |p|
+    j = post_json("#{BT}/assets/category.php", form + "&page=#{p}")
+    if j.nil?
+      log("не ответил: #{base} (страница #{p})")
+      return [out, false]
+    end
+    fresh = parse_bt(j['output'].to_s, section).reject { |l| ids[l[:id]] }
+    break if fresh.empty?                # за последней страницей список пуст или повторяется
+    fresh.each { |l| ids[l[:id]] = true }
+    pages += 1
+    now = Time.now
+    out.concat(fresh.reject { |l| l[:deadline] && l[:deadline] < now })
+    sleep 0.8
+  end
+  log("beltorgi.by · #{section}: #{out.size} активных, страниц #{pages}")
+  [out, true]
+end
+
+# Точные даты из карточки лота: «Начало подачи заявок» служит датой публикации.
+def bt_enrich(lot)
+  html = fetch(lot[:url]) or return
+  at = lambda do |k|
+    m = html.match(/<div>#{k}<\/div>\s*<div>\s*(\d{2})\.(\d{2})\.(\d{4})\D+(\d{1,2}):(\d{2})/) or return nil
+    Time.local(m[3].to_i, m[2].to_i, m[1].to_i, m[4].to_i, m[5].to_i)
+  end
+  lot[:deadline]  = at.('Окончание подачи заявок') || lot[:deadline]
+  lot[:published] = at.('Начало подачи заявок')
+  sleep 0.5
+end
+
 # Раздел читается ЦЕЛИКОМ, а не первой страницей.
 #
 # Раньше бот смотрел только первые 9–20 карточек, и это давало две ошибки.
@@ -143,6 +226,8 @@ end
 MAX_PAGES = 40
 
 def collect_section(platform, section, base)
+  return collect_bt(section, base) if platform == 'beltorgi.by'
+
   out = []
   ids = {}
   pages = 0
@@ -256,7 +341,15 @@ begin
     exit(bad.zero? ? 0 : 0)
   end
 
-  fresh = lots.reject { |l| seen.key?(l[:id]) }
+fresh = lots.reject { |l| seen.key?(l[:id]) }
+
+# beltorgi: заходим в каждый новый лот за точным сроком и датой публикации.
+# При --init это не нужно, а предел защищает от сотни запросов разом.
+unless mode == '--init'
+  bt = fresh.select { |l| l[:platform] == 'beltorgi.by' }
+  log("beltorgi: новых #{bt.size}, уточняю первые #{MAX_SEND * 2}") if bt.size > MAX_SEND * 2
+  bt.first(MAX_SEND * 2).each { |l| bt_enrich(l) }
+end
 
   # Второй предохранитель: e-auction отдаёт дату публикации. Лот, выставленный
   # больше FRESH_DAYS назад, — не новость, даже если бот его раньше не встречал.
