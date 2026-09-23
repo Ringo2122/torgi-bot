@@ -27,6 +27,7 @@ LOCK     = File.join(HOME, 'lock')
 TMPIMG   = File.join(HOME, 'photo.tmp')
 UA       = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140.0 Safari/537.36'
 MAX_SEND = (ENV['MAX_SEND'] || 25).to_i   # предохранитель от лавины сообщений
+FRESH_DAYS = (ENV['FRESH_DAYS'] || 3).to_i # старше — не новость, даже если бот видит лот впервые
 FileUtils.mkdir_p(HOME)
 
 SECTIONS = [
@@ -104,7 +105,9 @@ def parse_ea(html, section)
     next nil unless href && art
     img = ch[/<img src="(\/upload\/[^"]+)"/, 1]
     req = ch[/data-endrequest="(\d+)"/, 1].to_i
+    pub = ch[/data-startrequest="(\d+)"/, 1].to_i      # начало приёма заявок = публикация
     { id: "e-auction.by|#{art}", platform: 'e-auction.by', section: section,
+      published: pub.positive? ? Time.at(pub) : nil,
       name: clean(ch[/class="text-header">\s*([^<]*)/m, 1]),
       price: ch[/data-cur="BYN" data-value="([0-9.]+)"/, 1].to_f,
       deadline: req.positive? ? Time.at(req) : nil,
@@ -129,20 +132,57 @@ def parse_ipm(html, section)
   end.compact
 end
 
-def collect
-  lots = []
-  SECTIONS.each do |platform, section, url|
+# Раздел читается ЦЕЛИКОМ, а не первой страницей.
+#
+# Раньше бот смотрел только первые 9–20 карточек, и это давало две ошибки.
+# ИПМ-Торги сортируют не по дате публикации, а по дедлайну приёма заявок, от поздних
+# к ранним. Когда лоты сверху снимают с торгов, список сдвигается, и давно выставленный
+# лот въезжает на первую страницу — бот видел его впервые и слал как «новый».
+# И наоборот: свежий лот с коротким сроком заявок сразу ложится на вторую-третью
+# страницу, и бот не замечал его вовсе.
+MAX_PAGES = 40
+
+def collect_section(platform, section, base)
+  out = []
+  ids = {}
+  pages = 0
+  (1..MAX_PAGES).each do |p|
+    url = p == 1 ? base : "#{base}?PAGEN_1=#{p}"
     html = fetch(url)
     if html.nil?
       log("не ответил: #{url}")
-      next
+      return [out, false]                  # раздел прочитан не полностью
     end
     got = platform == 'e-auction.by' ? parse_ea(html, section) : parse_ipm(html, section)
-    log("#{platform} · #{section}: #{got.size}")
+    break if got.empty?
+    fresh = got.reject { |l| ids[l[:id]] }
+    break if fresh.empty?                  # e-auction за последней страницей повторяет её же
+    fresh.each { |l| ids[l[:id]] = true }
+    pages += 1
+    now = Time.now
+    out.concat(fresh.reject { |l| l[:deadline] && l[:deadline] < now })
+    # ИПМ-Торги отдают и архив до 2019 года; раз список по убыванию дедлайна,
+    # после первой страницы с уже закрытыми лотами активных дальше не будет
+    if platform == 'ipmtorgi.by'
+      oldest = got.map { |l| l[:deadline] }.compact.min
+      break if oldest && oldest < now
+    end
+    sleep 0.8
+  end
+  log("#{platform} · #{section}: #{out.size} активных, страниц #{pages}")
+  [out, true]
+end
+
+def collect
+  lots = []
+  complete = true
+  SECTIONS.each do |platform, section, url|
+    got, ok = collect_section(platform, section, url)
+    complete &&= ok
     lots.concat(got)
     sleep 1
   end
-  lots
+  [lots, complete]
 end
 
 # ---------- отправка ----------
@@ -201,8 +241,9 @@ begin
   end
 
   seen = File.exist?(SEEN) ? JSON.parse(File.read(SEEN)) : {}
-  lots = collect
+  lots, complete = collect
   abort('ни одна площадка не ответила') if lots.empty?
+  log('часть разделов прочитана не полностью — отправлю только то, что увидел') unless complete
 
   if mode == '--dry'
     lots.first(6).each do |l|
@@ -216,7 +257,15 @@ begin
   end
 
   fresh = lots.reject { |l| seen.key?(l[:id]) }
-  log("получено #{lots.size}, новых #{fresh.size}")
+
+  # Второй предохранитель: e-auction отдаёт дату публикации. Лот, выставленный
+  # больше FRESH_DAYS назад, — не новость, даже если бот его раньше не встречал.
+  # Такой лот молча запоминаем и не шлём.
+  stale_cut = Time.now - FRESH_DAYS * 86_400
+  stale, fresh = fresh.partition { |l| l[:published] && l[:published] < stale_cut }
+  stale.each { |l| seen[l[:id]] = Time.now.to_i }
+  log("получено #{lots.size}, новых #{fresh.size}" +
+      (stale.empty? ? '' : ", давно выставленных и пропущенных #{stale.size}"))
 
   if mode == '--init'
     lots.each { |l| seen[l[:id]] = Time.now.to_i }
