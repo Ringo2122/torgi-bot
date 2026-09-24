@@ -38,6 +38,9 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TORGI_HOME: ${{ github.workspace }}/state
           MODE: ${{ github.event.inputs.mode }}
+          SB_URL: ${{ secrets.SB_URL }}         # админка сайта: настройки бота и отчёт о проверках
+          SB_KEY: ${{ secrets.SB_KEY }}
+          SB_TOKEN: ${{ secrets.SB_TOKEN }}
         run: |
           case "$MODE" in
             test) ruby tgbot.rb --test ;;
