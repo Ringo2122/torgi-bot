@@ -13,6 +13,8 @@ require 'json'
 require 'fileutils'
 require 'shellwords'
 require 'time'
+require 'net/http'
+require 'uri'
 Encoding.default_external = Encoding::UTF_8
 Encoding.default_internal = Encoding::UTF_8
 
@@ -337,6 +339,32 @@ def collect
   [lots, complete]
 end
 
+# ---------- админка сайта (Supabase): настройки бота и отчёт о проверке ----------
+# SB_URL, SB_KEY, SB_TOKEN — секреты GitHub. Без них или при сбое базы бот работает как обычно.
+def sb(meth, path, body = nil)
+  return nil if %w[SB_URL SB_KEY SB_TOKEN].any? { |k| ENV[k].to_s.empty? }
+  u = URI("#{ENV['SB_URL']}/rest/v1/#{path}")
+  r = Net::HTTP.const_get(meth.capitalize).new(u)
+  r['apikey'] = ENV['SB_KEY']
+  r['x-admin-token'] = ENV['SB_TOKEN']
+  r['Content-Type'] = 'application/json'
+  r['Accept-Encoding'] = 'identity'
+  r['Prefer'] = 'return=minimal' if body
+  r.body = JSON.generate(body) if body
+  res = Net::HTTP.start(u.host, u.port, use_ssl: true, open_timeout: 10, read_timeout: 20) { |h| h.request(r) }
+  raise "#{res.code} #{res.body.to_s[0, 200]}" unless res.code.to_i < 300
+  res.body.to_s.empty? ? nil : JSON.parse(res.body)
+rescue StandardError => e
+  log("админка недоступна: #{e.message}")
+  nil
+end
+
+# { 'paused' => true/false, 'off' => ['площадка|раздел', …] }
+def bot_settings
+  row = (sb('get', 'settings?k=eq.bot&select=v') || []).first
+  row && row['v'].is_a?(Hash) ? row['v'] : {}
+end
+
 # ---------- отправка ----------
 def money(n)
   return 'цена не указана' if n.to_f <= 0
@@ -459,6 +487,14 @@ end
     exit 0
   end
 
+  # из админки: пауза и выключенные разделы — такие лоты запоминаем без отправки,
+  # чтобы после включения не пришла пачка старых
+  bcfg = bot_settings
+  offs = bcfg['off'] || []
+  muted, fresh = fresh.partition { |l| bcfg['paused'] || offs.include?("#{l[:platform]}|#{l[:section]}") }
+  muted.each { |l| seen[l[:id]] = Time.now.to_i }
+  log(bcfg['paused'] ? "бот на паузе: #{muted.size} новых запомнил без отправки" : "выключенные в админке разделы: #{muted.size} без отправки") unless muted.empty?
+
   if fresh.size > MAX_SEND
     log("новых #{fresh.size} — это больше предохранителя #{MAX_SEND}; отправлю #{MAX_SEND}, остальные помечу прочитанными")
   end
@@ -470,6 +506,7 @@ end
 
   cid = chat_id
   sent = 0
+  sent_by = Hash.new(0)
   fresh.sort_by { |l| l[:deadline] || Time.now }.each do |l|
     if sent >= MAX_SEND
       seen[l[:id]] = Time.now.to_i        # осознанно пропускаем: сработал предохранитель
@@ -477,6 +514,7 @@ end
     end
     if send_lot(l, cid)
       sent += 1
+      sent_by[l[:platform]] += 1
       seen[l[:id]] = Time.now.to_i
       fails.delete(l[:id])
     else
@@ -498,6 +536,8 @@ end
   seen.reject! { |_, t| t.to_i < cutoff }
   File.write(SEEN, JSON.generate(seen))
   log("отправлено #{sent}, в памяти #{seen.size}")
+  sb('post', 'bot_runs', { 'sent' => sent, 'stats' => { 'fresh' => fresh.size + muted.size, 'muted' => muted.size, 'dups' => dups.size, 'by' => sent_by },
+                          'errors' => complete ? nil : 'часть разделов прочитана не полностью' })
 ensure
   File.delete(LOCK) if File.exist?(LOCK)
 end
