@@ -2,8 +2,7 @@
 # encoding: utf-8
 #
 # Сторож торгов: следит за разделами недвижимости и транспорта на e-auction.by, ipmtorgi.by
-# и beltorgi.by
-# и шлёт в Telegram карточку по каждому новому лоту: фото, цена, дата окончания приёма заявок.
+# и beltorgi.by, шлёт в Telegram карточку по каждому новому лоту: название, фото, цена, дата окончания приёма заявок.
 #
 #   ruby tgbot.rb --init    первый запуск: запомнить текущие лоты и НИЧЕГО не слать
 #   ruby tgbot.rb           обычный запуск: прислать только новые
@@ -211,6 +210,9 @@ def bt_enrich(lot)
     Time.local(m[3].to_i, m[2].to_i, m[1].to_i, m[4].to_i, m[5].to_i)
   end
   lot[:deadline]  = at.('Окончание подачи заявок') || lot[:deadline]
+  # в списке название бывает обрезано — берём полное из заголовка лота
+  title = clean(html[/<h1[^>]*>(.*?)<\/h1>/m, 1])
+  lot[:name] = title unless title.empty?
   lot[:published] = at.('Начало подачи заявок')
   sleep 0.5
 end
@@ -276,8 +278,16 @@ def money(n)
   "#{n.round.to_s.reverse.scan(/\d{1,3}/).join(' ').reverse} BYN"
 end
 
+# Telegram разбирает подпись как HTML — угловые скобки и & в названии нужно экранировать
+def html_esc(s)
+  s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+end
+
 def send_lot(lot, cid)
-  caption = "<b>#{money(lot[:price])}</b>\n" \
+  name = lot[:name].to_s
+  name = name[0, 300].sub(/\s\S*\z/, '') + '…' if name.size > 300   # подпись к фото — не длиннее 1024 знаков
+  caption = "#{html_esc(name)}\n\n" \
+            "<b>#{money(lot[:price])}</b>\n" \
             "Заявки до #{lot[:deadline] ? lot[:deadline].strftime('%d.%m.%Y %H:%M') : '—'}\n" \
             "<a href=\"#{lot[:url]}\">#{lot[:platform]} · #{lot[:section]}</a>"
   if lot[:photo]
