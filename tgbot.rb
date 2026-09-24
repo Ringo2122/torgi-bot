@@ -327,6 +327,8 @@ def collect
   lots = []
   complete = true
   SECTIONS.each do |platform, section, url|
+    # konfiskat.by закрывает доступ при частых запросах; сроки там на дни вперёд — хватит раз в час
+    next if platform == 'konfiskat.by' && Time.now.min >= 15 && ENV['FORCE_ALL'].to_s.empty?
     got, ok = collect_section(platform, section, url)
     complete &&= ok
     lots.concat(got)
