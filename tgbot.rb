@@ -1,8 +1,8 @@
 #!/usr/bin/env ruby
 # encoding: utf-8
 #
-# Сторож торгов: следит за разделами недвижимости и транспорта на e-auction.by, ipmtorgi.by
-# beltorgi.by, cpo.by и konfiskat.by, шлёт в Telegram карточку по каждому новому лоту: название, фото, цена, дата окончания приёма заявок.
+# Сторож торгов: следит за разделами недвижимости и транспорта на e-auction.by, ipmtorgi.by,
+# beltorgi.by и konfiskat.by (cpo.by с 25.09.2026 не читаем — это рекламная витрина торгов ИПМ), шлёт в Telegram карточку по каждому новому лоту: название, фото, цена, дата окончания приёма заявок.
 #
 #   ruby tgbot.rb --init    первый запуск: запомнить текущие лоты и НИЧЕГО не слать
 #   ruby tgbot.rb           обычный запуск: прислать только новые
@@ -42,8 +42,6 @@ SECTIONS = [
   ['beltorgi.by',  'Легковые авто',          'https://beltorgi.by/legkovye-avto/'],
   ['beltorgi.by',  'Грузовые и автобусы',    'https://beltorgi.by/gruzovye-avto/'],
   ['beltorgi.by',  'Грузовые и автобусы',    'https://beltorgi.by/avtobusy/'],
-  ['cpo.by',       'Недвижимость',           'https://www.cpo.by/auctions/filter/section-is-nedvizhimost/apply/'],
-  ['cpo.by',       'Транспорт и спецтехника','https://www.cpo.by/auctions/filter/section-is-transport-i-spetstekhnika/apply/'],
   ['konfiskat.by', 'Автотранспорт',          'https://konfiskat.by/avtotransport/auktsiony/'],
   ['konfiskat.by', 'Недвижимость',           'https://konfiskat.by/nedvizhimost/auktsiony/']
 ].freeze
@@ -143,19 +141,10 @@ def parse_ipm(html, section)
 end
 
 # ---------- beltorgi.by ----------
-# Каталог грузится скриптом. Страница раздела отдаёт content_id и cachekey (он меняется
-# при каждом открытии), а карточки приходят JSON-ом из POST /assets/category.php, по 80.
-# На карточке нет ни даты публикации, ни срока заявок — только обратный отсчёт.
-# Поэтому срок из отсчёта — прикидка, а точные даты новых лотов берутся из самого лота.
+# Каталог — обычные страницы: /<раздел>/?limit=80&page=N (с 25.09.2026; раньше карточки приходили
+# JSON-ом из POST /assets/category.php). На карточке нет ни даты публикации, ни срока заявок —
+# только обратный отсчёт. Поэтому срок из отсчёта — прикидка, а точные даты новых лотов берутся из самого лота.
 BT = 'https://beltorgi.by'
-
-def post_json(url, data)
-  out = IO.popen(['curl', '-sS', '-m', '60', '-A', UA, '-H', 'X-Requested-With: XMLHttpRequest',
-                  '-d', data, url], err: File::NULL, &:read)
-  JSON.parse(out.to_s.force_encoding('UTF-8'))
-rescue JSON::ParserError
-  nil
-end
 
 def parse_bt(html, section)
   html.split('class="col mb-4"').drop(1).map do |ch|
@@ -178,31 +167,28 @@ def parse_bt(html, section)
 end
 
 def collect_bt(section, base)
-  page = fetch(base)
-  cid = page && page[/name="content_id" value="(\d+)"/, 1]
-  key = page && page[/name="cachekey" value="(\d+)"/, 1]
-  unless cid && key
-    log("не ответил: #{base}")
-    return [[], false]
-  end
-  form = "content_id=#{cid}&cachekey=#{key}&tpl=CardTplList&view=tab&tpltable=CardTplTable" \
-         '&ListWrapper=ListWrapper&filtr%5Barray%5D%5Bresult%5D=1%2C6%2C8&limit=80&sort=1&order=1'
   out = []
   ids = {}
   pages = 0
   (1..MAX_PAGES).each do |p|
-    j = post_json("#{BT}/assets/category.php", form + "&page=#{p}")
-    if j.nil?
+    html = fetch("#{base}?limit=80&page=#{p}")
+    if html.nil?
       log("не ответил: #{base} (страница #{p})")
       return [out, false]
     end
-    fresh = parse_bt(j['output'].to_s, section).reject { |l| ids[l[:id]] }
+    got = parse_bt(html, section)
+    fresh = got.reject { |l| ids[l[:id]] }
     break if fresh.empty?                # за последней страницей список пуст или повторяется
     fresh.each { |l| ids[l[:id]] = true }
     pages += 1
     now = Time.now
     out.concat(fresh.reject { |l| l[:deadline] && l[:deadline] < now })
+    break if got.size < 80
     sleep 0.8
+  end
+  if pages.zero?
+    log("не разобран: #{base}")
+    return [out, false]
   end
   log("beltorgi.by · #{section}: #{out.size} активных, страниц #{pages}")
   [out, true]
@@ -220,30 +206,6 @@ def bt_enrich(lot)
   title = clean(html[/<h1[^>]*>(.*?)<\/h1>/m, 1])
   lot[:name] = title unless title.empty?
   lot[:published] = at.('Начало подачи заявок')
-  sleep 0.5
-end
-
-# ---------- cpo.by (ЦПО — организатор торгов на ИПМ) ----------
-# Список по дате аукциона от поздних к ранним, с архивом. Срока заявок в списке нет — для новых
-# лотов берём его со страницы лота (cpo_enrich). Большинство лотов — те же, что на ИПМ: см. sig().
-def parse_cpo(html, section)
-  html.split('class="sales__item"').drop(1).map do |ch|
-    ch = ch[0, 5000]
-    slug = ch[%r{href="https://www\.cpo\.by/auctions/([^/"]+)/"}, 1] or next
-    day = ch[/sales__item-title-date.*?(\d{2})\.(\d{2})\.(\d{4})/m] ? Time.local($3.to_i, $2.to_i, $1.to_i) : nil
-    pr = clean(ch[/sales__item-price__bottom[^>]*>(.*?)<div class="valute_price"/m, 1])
-    img = ch[/background-image: url\('(\/upload\/[^']+)'\)/, 1]
-    { id: "cpo.by|#{slug}", platform: 'cpo.by', section: section, day: day,
-      name: clean(ch[/sales__item-title-title">(.*?)<\/div>/m, 1]),
-      price: pr.include?('BYN') ? pr[/[\d\s.,]+(?=\s*BYN)/].to_s.gsub(/[^\d.]/, '').to_f : 0.0,
-      deadline: nil, photo: img ? 'https://www.cpo.by' + img : nil, url: "https://www.cpo.by/auctions/#{slug}/" }
-  end.compact
-end
-
-def cpo_enrich(lot)
-  html = fetch(lot[:url]) or return
-  m = html.match(/Время окончания приёма заявок:<\/b>\s*<br\s*\/?>\s*(\d{2})\.(\d{2})\.(\d{4})(?:\s|&nbsp;)+(\d{1,2}):(\d{2})/)
-  lot[:deadline] = Time.local(m[3].to_i, m[2].to_i, m[1].to_i, m[4].to_i, m[5].to_i) if m
   sleep 0.5
 end
 
@@ -295,7 +257,6 @@ def collect_section(platform, section, base)
     end
     got = case platform
           when 'e-auction.by' then parse_ea(html, section)
-          when 'cpo.by'       then parse_cpo(html, section)
           when 'konfiskat.by' then parse_kf(html, section)
           else parse_ipm(html, section)
           end
@@ -313,11 +274,6 @@ def collect_section(platform, section, base)
     if platform == 'ipmtorgi.by'
       oldest = got.map { |l| l[:deadline] }.compact.min
       break if oldest && oldest < now
-    end
-    # ЦПО — так же, по дате аукциона
-    if platform == 'cpo.by'
-      oldest = got.map { |l| l[:day] }.compact.min
-      break if oldest && oldest < today
     end
     sleep 0.8
   end
@@ -447,10 +403,9 @@ begin
 fresh = lots.reject { |l| seen.key?(l[:id]) }
 
 # Дубли: такой же лот (название + цена) уже встречался на другой площадке — не шлём.
-# И внутри прогона: ИПМ и ЦПО выставили лот одновременно — оставляем ИПМ.
+# И внутри прогона: лот выставили на двух площадках одновременно — оставляем первый.
 known = Hash.new { |h, k| h[k] = [] }
 seen.each_key { |k| next unless k.start_with?('sig|'); _, p, sg = k.split('|', 3); known[sg] << p }
-fresh = fresh.each_with_index.sort_by { |l, i| [l[:platform] == 'cpo.by' ? 1 : 0, i] }.map(&:first)
 firsts = {}
 dups, fresh = fresh.partition do |l|
   sg = sig(l)
@@ -467,7 +422,6 @@ unless mode == '--init'
   bt = fresh.select { |l| l[:platform] == 'beltorgi.by' }
   log("beltorgi: новых #{bt.size}, уточняю первые #{MAX_SEND * 2}") if bt.size > MAX_SEND * 2
   bt.first(MAX_SEND * 2).each { |l| bt_enrich(l) }
-  fresh.select { |l| l[:platform] == 'cpo.by' }.first(MAX_SEND * 2).each { |l| cpo_enrich(l) }
 end
 
   # Второй предохранитель: e-auction отдаёт дату публикации. Лот, выставленный
